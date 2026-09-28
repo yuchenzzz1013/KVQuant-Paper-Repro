@@ -7,10 +7,9 @@ _PATCHED: List = []
 def patch_model(model: nn.Module, quantizer):
     """把 KVQuantizer 挂到每层的 k_proj / v_proj。
 
-    注意：hook 直接返回反量化后的 K/V，
-    - K 发生在 RoPE 之前（Pre-RoPE Key 量化，论文 3.2）
-    - V 保持 per-token 量化
-    这是为 PPL 复现实验设计的轻量实现。
+    - K hook 在 RoPE 之前（Pre-RoPE Key 量化，论文 §3.2）
+    - V hook 保持 per-token 量化
+    - 仅做反量化替换，不做真实内存压缩（PPL 复现用）
     """
     global _PATCHED
     unpatch_model(model)
@@ -22,11 +21,13 @@ def patch_model(model: nn.Module, quantizer):
 
         def make_k_hook(idx):
             def hook(module, inp, out):
+                assert out.dim() == 3, f"k_proj 输出维度异常: {out.shape}"
                 return quantizer.quantize_k(idx, out)
             return hook
 
         def make_v_hook(idx):
             def hook(module, inp, out):
+                assert out.dim() == 3, f"v_proj 输出维度异常: {out.shape}"
                 return quantizer.quantize_v(idx, out)
             return hook
 

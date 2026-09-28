@@ -1,24 +1,25 @@
 ﻿import torch
 
-from .dense_sparse import extract_outliers, pack_csr
+from .dense_sparse import extract_outliers
 
 
 def _lut_lookup(x_norm: torch.Tensor, codebook: torch.Tensor):
     """向量化 LUT 查找。
 
-    x_norm: [..., D]，已归一化到 [-1,1]
+    x_norm:   [..., D]，已归一化到 [-1,1]
     codebook: [2^b]
     返回:
-        idx: [..., D] int64
+        idx:     [..., D] int64
         dequant: [..., D] float32
     """
-    cb = codebook.to(x_norm.device, dtype=torch.float32).reshape(1, -1)
+    cb = codebook.to(x_norm.device, dtype=torch.float32).reshape(-1)  # [2^b]
     shape = x_norm.shape
-    flat = x_norm.reshape(-1, 1).float()
-    # 广播求距离： [N, 2^b]
-    idx = (flat - cb).abs().argmin(dim=-1)
-    dequant = cb[0][idx].reshape(shape)
-    return idx.reshape(shape), dequant
+    flat = x_norm.reshape(-1).float()                                # [N]
+    # 距离矩阵 [N, 2^b]
+    dist = (flat.unsqueeze(1) - cb.unsqueeze(0)).abs()
+    idx = dist.argmin(dim=-1)                                        # [N]
+    dequant = cb.gather(0, idx)                                      # [N]
+    return idx.reshape(shape), dequant.reshape(shape)
 
 
 class KVQuantizer:
@@ -72,11 +73,13 @@ class KVQuantizer:
         if k_rest.numel() == 0:
             return k
 
-        k_norm = torch.clamp((k_rest - zero) / (scale + 1e-8), -1, 1)
+        k_norm = torch.clamp((k_rest.float() - zero) / (scale + 1e-8), -1, 1)
+        # dim=1（token 维）挑 outlier，per-channel
         dense_k, outliers_k = self._dense_sparse(k_norm, dim=1)
         _, q = _lut_lookup(dense_k, codebook)
         k_dequant = (q + outliers_k) * scale + zero
 
+        k_dequant = k_dequant.to(k.dtype)
         if k_sink is not None:
             k_dequant = torch.cat([k_sink, k_dequant], dim=1)
         return k_dequant
@@ -90,39 +93,39 @@ class KVQuantizer:
         if v_rest.numel() == 0:
             return v
 
-        v_min = v_rest.min(dim=-1, keepdim=True).values
-        v_max = v_rest.max(dim=-1, keepdim=True).values
+        vf = v_rest.float()
+        v_min = vf.min(dim=-1, keepdim=True).values
+        v_max = vf.max(dim=-1, keepdim=True).values
         scale = (v_max - v_min) / 2.0
         zero = (v_max + v_min) / 2.0
 
-        v_norm = torch.clamp((v_rest - zero) / (scale + 1e-8), -1, 1)
+        v_norm = torch.clamp((vf - zero) / (scale + 1e-8), -1, 1)
+        # dim=-1（channel 维）挑 outlier，per-token
         dense_v, outliers_v = self._dense_sparse(v_norm, dim=-1)
         _, q = _lut_lookup(dense_v, codebook)
         v_dequant = (q + outliers_v) * scale + zero
 
+        v_dequant = v_dequant.to(v.dtype)
         if v_sink is not None:
             v_dequant = torch.cat([v_sink, v_dequant], dim=1)
         return v_dequant
 
     # ---------- 压缩存储（用于真实内存节省 / kernel 复现） ----------
     def compress_k_to_csr(self, layer_idx: int, k: torch.Tensor):
-        """K 以 per-channel 量化 + CSR 稀疏存储。
+        from .dense_sparse import pack_csr
 
-        k: [B, S, H]
-        返回 dict：q_idx / outlier_* / scale / zero / codebook
-        """
         codebook = self.k_codebooks[layer_idx]
         scale = self.k_scales[layer_idx].to(k.device).float()
         zero = self.k_zeros[layer_idx].to(k.device).float()
 
-        k_norm = torch.clamp((k - zero) / (scale + 1e-8), -1, 1)
+        k_norm = torch.clamp((k.float() - zero) / (scale + 1e-8), -1, 1)
         dense_x, outliers, _ = extract_outliers(
             k_norm, outlier_ratio=self.outlier_ratio, dim=1
         )
         idx, _ = _lut_lookup(dense_x, codebook)
 
         B, S, H = outliers.shape
-        # [B, S, H] -> [B*H, S]，沿 token 维稀疏（与 CSC-on-K 等价）
+        # [B, S, H] -> [B*H, S]，沿 token 维稀疏（等价 CSC-on-K）
         outliers_2d = outliers.permute(0, 2, 1).reshape(B * H, S)
         values, col_indices, row_ptr = pack_csr(outliers_2d)
 
@@ -138,22 +141,24 @@ class KVQuantizer:
         }
 
     def compress_v_to_csr(self, layer_idx: int, v: torch.Tensor):
-        """V 以 per-token 量化 + CSR 稀疏存储（按 token 行）。"""
+        from .dense_sparse import pack_csr
+
         codebook = self.v_codebooks[layer_idx]
 
-        v_min = v.min(dim=-1, keepdim=True).values
-        v_max = v.max(dim=-1, keepdim=True).values
+        vf = v.float()
+        v_min = vf.min(dim=-1, keepdim=True).values
+        v_max = vf.max(dim=-1, keepdim=True).values
         scale = (v_max - v_min) / 2.0
         zero = (v_max + v_min) / 2.0
 
-        v_norm = torch.clamp((v - zero) / (scale + 1e-8), -1, 1)
+        v_norm = torch.clamp((vf - zero) / (scale + 1e-8), -1, 1)
         dense_x, outliers, _ = extract_outliers(
             v_norm, outlier_ratio=self.outlier_ratio, dim=-1
         )
         idx, _ = _lut_lookup(dense_x, codebook)
 
         B, S, H = outliers.shape
-        outliers_2d = outliers.reshape(B * S, H)  # 每个 token 一行
+        outliers_2d = outliers.reshape(B * S, H)  # 每 token 一行
         values, col_indices, row_ptr = pack_csr(outliers_2d)
 
         return {

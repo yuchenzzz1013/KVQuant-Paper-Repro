@@ -16,7 +16,7 @@ def evaluate_perplexity(
 ):
     """滑动窗口 PPL 评估。
 
-    - 拼接全部文本后按 stride 切窗，避免 token 边界处 loss 计算异常
+    - 拼接全文后按 stride 切窗，避免 token 边界处 loss 异常
     - 最后一个不满窗的 chunk 若长度 < 2 直接跳过
     - PPL = exp(Σ NLL / Σ valid_tokens)
     """
@@ -41,11 +41,10 @@ def evaluate_perplexity(
         input_chunk = input_ids[:, begin:end]
         target_chunk = input_chunk.clone()
 
-        # 若是滑动窗口，前 prev_end-begin 个 token 不作为 target（已算过）
         if prev_end > begin:
             target_chunk[:, : prev_end - begin] = -100
 
-        outputs = model(input_chunk, labels=target_chunk)
+        outputs = model(input_chunk, labels=target_chunk, use_cache=False)
         valid = (target_chunk != -100).sum().item()
         total_nll += outputs.loss.item() * valid
         total_tokens += valid

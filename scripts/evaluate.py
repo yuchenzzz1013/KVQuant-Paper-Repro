@@ -4,7 +4,7 @@ import torch
 
 from kvquant.model_loader import load_hf_model
 from kvquant.quant.kv_quantizer import KVQuantizer
-from kvquant.attention_patch import patch_model
+from kvquant.attention_patch import patch_model, unpatch_model
 from benchmarks.perplexity import evaluate_perplexity
 
 
@@ -22,6 +22,7 @@ def main():
         args.model_path, device_map=None, torch_dtype=torch.float16
     )
     model.to(device)
+    model.config.use_cache = False  # 避免 KV cache 干扰 PPL
 
     with open(args.calib, "rb") as f:
         calib = pickle.load(f)
@@ -34,13 +35,27 @@ def main():
         k_bits=args.n_bits,
         v_bits=args.n_bits,
         outlier_ratio=args.outlier_ratio,
-        sink_token=True,
-        use_dense_sparse=True,
+        sink_token=calib.get("sink_token", True),
+        use_dense_sparse=args.outlier_ratio > 0,
     )
 
     patch_model(model, quantizer)
-    ppl = evaluate_perplexity(model, tokenizer, seq_len=args.seq_len, device=device)
-    print(f"Perplexity: {ppl:.4f}")
+
+    # fp16 baseline（先 unpatch 再测）
+    try:
+        ppl_fp16 = evaluate_perplexity(
+            model, tokenizer, seq_len=args.seq_len, device=device
+        )
+        print(f"[fp16 baseline] Perplexity: {ppl_fp16:.4f}")
+    except Exception as e:
+        print(f"fp16 baseline failed: {e}")
+
+    ppl_q = evaluate_perplexity(
+        model, tokenizer, seq_len=args.seq_len, device=device
+    )
+    print(f"[KVQuant {args.n_bits}-bit] Perplexity: {ppl_q:.4f}")
+
+    unpatch_model(model)
 
 
 if __name__ == "__main__":
