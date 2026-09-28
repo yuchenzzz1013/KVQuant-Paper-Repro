@@ -27,71 +27,60 @@ class KVQuantizer:
         self.use_dense_sparse = use_dense_sparse
 
     # ---------- 内部工具 ----------
-
     def _quantize_to_codebook(self, x_norm: torch.Tensor, codebook: torch.Tensor):
         codebook = codebook.to(x_norm.device).float()
         x_flat = x_norm.reshape(-1, 1).float()
         cb = codebook.reshape(1, -1)
         idx = (x_flat - cb).abs().argmin(dim=-1)
-        quant = codebook[idx].reshape(x_norm.shape)
-        return quant
+        return codebook[idx].reshape(x_norm.shape)
 
-    def _quantize_per_vector(self, x_norm, codebook, dim):
-        """per-vector（per-channel 或 per-token）量化 + dense-and-sparse。"""
+    def _dense_sparse(self, x_norm, dim):
         if self.use_dense_sparse and self.outlier_ratio > 0:
             dense_x, outliers, _ = extract_outliers(
                 x_norm, outlier_ratio=self.outlier_ratio, dim=dim
             )
         else:
-            dense_x, outliers = x_norm, torch.zeros_like(x_norm)
+            dense_x = x_norm
+            outliers = torch.zeros_like(x_norm)
+        return dense_x, outliers
 
-        q = self._quantize_to_codebook(dense_x, codebook)
-        return q, outliers
-
-    # ---------- Key：Per-Channel + Pre-RoPE ----------
-
+    # ---------- Key: Per-Channel + Pre-RoPE ----------
     def quantize_k(self, layer_idx: int, k: torch.Tensor):
         """
-        k: [B, S, H]  来自 k_proj 输出，尚未应用 RoPE。
-        Per-Channel Key Quantization（论文 3.1）。
+        k: [B, S, H]，来自 k_proj，RoPE 之前。
         """
         codebook = self.k_codebooks[layer_idx]
-        scale = self.k_scales[layer_idx].to(k.device).float()
-        zero = self.k_zeros[layer_idx].to(k.device).float()
+        scale = self.k_scales[layer_idx].to(k.device).float()   # [H]
+        zero = self.k_zeros[layer_idx].to(k.device).float()      # [H]
 
         if self.sink_token:
             k_sink = k[:, :1, :]
             k_rest = k[:, 1:, :]
         else:
-            k_sink = None
-            k_rest = k
+            k_sink, k_rest = None, k
 
         if k_rest.numel() == 0:
             return k
 
-        # 归一化到 [-1, 1]，按 channel 广播
-        k_norm = (k_rest - zero) / (scale + 1e-8)
-        k_norm = torch.clamp(k_norm, -1, 1)
+        # 逐通道归一化（channel 为最后一维）
+        k_norm = torch.clamp((k_rest - zero) / (scale + 1e-8), -1, 1)
 
-        # per-channel 的 dim 是 S 维度（dim=1）
-        q, outliers = self._quantize_per_vector(
-            k_norm, codebook, dim=1
-        )
+        # 逐通道 outlier：沿 token 维度（dim=1）
+        dense_k, outliers_k = self._dense_sparse(k_norm, dim=1)
 
-        k_dequant = q * scale + zero
-        k_dequant = k_dequant + outliers * scale
+        q = self._quantize_to_codebook(dense_k, codebook)
+
+        # 反量化: k ≈ (q + outliers) * scale + zero
+        k_dequant = (q + outliers_k) * scale + zero
 
         if self.sink_token:
             k_dequant = torch.cat([k_sink, k_dequant], dim=1)
-
         return k_dequant
 
-    # ---------- Value：Per-Token ----------
-
+    # ---------- Value: Per-Token ----------
     def quantize_v(self, layer_idx: int, v: torch.Tensor):
         """
-        v: [B, S, H]  来自 v_proj 输出。
-        Per-Token Value Quantization（论文 3.1 / 3.6）。
+        v: [B, S, H]，来自 v_proj。
         """
         codebook = self.v_codebooks[layer_idx]
 
@@ -99,50 +88,40 @@ class KVQuantizer:
             v_sink = v[:, :1, :]
             v_rest = v[:, 1:, :]
         else:
-            v_sink = None
-            v_rest = v
+            v_sink, v_rest = None, v
 
         if v_rest.numel() == 0:
             return v
 
-        # 在线计算 per-token min/max
+        # 在线逐 token min/max
         v_min = v_rest.min(dim=-1, keepdim=True).values
         v_max = v_rest.max(dim=-1, keepdim=True).values
         scale = (v_max - v_min) / 2.0
         zero = (v_max + v_min) / 2.0
 
-        v_norm = (v_rest - zero) / (scale + 1e-8)
-        v_norm = torch.clamp(v_norm, -1, 1)
+        v_norm = torch.clamp((v_rest - zero) / (scale + 1e-8), -1, 1)
 
-        # per-token 的 dim 是 H 维度（dim=-1）
-        q, outliers = self._quantize_per_vector(
-            v_norm, codebook, dim=-1
-        )
+        # 逐 token outlier：沿 channel 维度（dim=-1）
+        dense_v, outliers_v = self._dense_sparse(v_norm, dim=-1)
 
-        v_dequant = q * scale + zero
-        v_dequant = v_dequant + outliers * scale
+        q = self._quantize_to_codebook(dense_v, codebook)
+        v_dequant = (q + outliers_v) * scale + zero
 
         if self.sink_token:
             v_dequant = torch.cat([v_sink, v_dequant], dim=1)
-
         return v_dequant
 
-    # ---------- 存储接口（可选，真省显存用） ----------
-
+    # ---------- 压缩存储接口 ----------
     def compress_k_to_csr(self, layer_idx: int, k: torch.Tensor):
-        """
-        返回 CSR 压缩表示，用于真正节省显存。
-        """
         codebook = self.k_codebooks[layer_idx]
         scale = self.k_scales[layer_idx].to(k.device).float()
         zero = self.k_zeros[layer_idx].to(k.device).float()
 
         k_norm = torch.clamp((k - zero) / (scale + 1e-8), -1, 1)
-        dense_x, outliers, mask = extract_outliers(
+        dense_x, outliers, _ = extract_outliers(
             k_norm, outlier_ratio=self.outlier_ratio, dim=1
         )
 
-        # 量化 indices（真正的 4-bit 存储可换成 bit-pack）
         codebook = codebook.to(k.device).float()
         flat = dense_x.reshape(-1, 1)
         cb = codebook.reshape(1, -1)

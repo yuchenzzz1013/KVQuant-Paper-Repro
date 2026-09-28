@@ -1,6 +1,6 @@
 ﻿# KVQuant 复现（个人轻量级 PyTorch 版）
 
-> ⚠️ 仅为个人轻量级复现，未实现 CUDA kernel 与 10M 上下文，精度趋势可参考，数值不完全对齐论文。
+> ⚠️ 仅为个人轻量级复现
 
 - 论文：https://arxiv.org/abs/2401.18079
 - 官方代码：https://github.com/SqueezeAILab/KVQuant

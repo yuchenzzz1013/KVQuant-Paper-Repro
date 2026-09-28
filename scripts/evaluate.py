@@ -14,6 +14,7 @@ def main():
     parser.add_argument("--calib", default="kvquant_calib.pkl")
     parser.add_argument("--n_bits", type=int, default=3)
     parser.add_argument("--seq_len", type=int, default=2048)
+    parser.add_argument("--outlier_ratio", type=float, default=0.01)
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -32,12 +33,12 @@ def main():
         k_zeros=calib["k_zeros"],
         k_bits=args.n_bits,
         v_bits=args.n_bits,
-        outlier_ratio=0.01,
+        outlier_ratio=args.outlier_ratio,
         sink_token=True,
+        use_dense_sparse=True,
     )
 
     patch_model(model, quantizer)
-
     ppl = evaluate_perplexity(model, tokenizer, seq_len=args.seq_len, device=device)
     print(f"Perplexity: {ppl:.4f}")
 
