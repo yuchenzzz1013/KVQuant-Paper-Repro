@@ -1,17 +1,19 @@
 ﻿from typing import List
-
 from torch import nn
 
 _PATCHED: List = []
 
 
 def patch_model(model: nn.Module, quantizer):
-    """
-    把 KVQuantizer 挂到每层的 k_proj / v_proj 上。
-    Pre-RoPE Key 量化 = hook 在 k_proj 之后、RoPE 之前。
+    """把 KVQuantizer 挂到每层的 k_proj / v_proj。
+
+    注意：hook 直接返回反量化后的 K/V，
+    - K 发生在 RoPE 之前（Pre-RoPE Key 量化，论文 3.2）
+    - V 保持 per-token 量化
+    这是为 PPL 复现实验设计的轻量实现。
     """
     global _PATCHED
-    unpatch_model(model)  # 先清掉旧的
+    unpatch_model(model)
 
     hooks = []
     for i, layer in enumerate(model.model.layers):
