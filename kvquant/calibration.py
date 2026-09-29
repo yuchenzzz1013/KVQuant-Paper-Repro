@@ -16,17 +16,6 @@ def calibrate(
     outlier_ratio: float = 0.01,
     sink_token: bool = True,
 ):
-    """离线校准（论文 §3.3 / §3.4 / §3.5 / §3.6）。
-
-    - Key:   Per-Channel Pre-RoPE
-             -> 逐通道 scale/zero（离线）
-             -> 逐层 NUQ codebook（Fisher 加权 KMeans）
-    - Value: Per-Token
-             -> 逐层 NUQ codebook（Fisher 加权 KMeans）
-             -> scale/zero 留给在线逐 token 计算
-
-    layer_bits: 可选，{layer_idx: bit_width}。若为 None 则全部使用 n_bits。
-    """
     model.eval()
     n_layers = len(model.model.layers)
 
@@ -104,52 +93,63 @@ def calibrate(
     for i in range(n_layers):
         bits_i = layer_bits[i]
 
-        # ---------- Key: Per-Channel Pre-RoPE ----------
+        # ---------------- Key: Per-Channel Pre-RoPE ----------------
+        # k_cat: [n_samples, S, C] -> reshape 成 [N, C]
         k_cat = torch.cat(k_acts[i], dim=0)
-        k_min = k_cat.min(dim=0).values
-        k_max = k_cat.max(dim=0).values
-        scale = (k_max - k_min) / 2.0
-        zero = (k_max + k_min) / 2.0
+        C = k_cat.shape[-1]
+        k_flat = k_cat.reshape(-1, C)
 
-        k_norm = torch.clamp((k_cat - zero) / (scale + 1e-8), -1, 1)
-        k_dense, _, k_mask = extract_outliers(
-            k_norm, outlier_ratio=outlier_ratio, dim=0
+        k_min = k_flat.min(dim=0).values   # [C]
+        k_max = k_flat.max(dim=0).values   # [C]
+        scale = (k_max - k_min) / 2.0      # [C]
+        zero = (k_max + k_min) / 2.0       # [C]
+
+        # 不 clamp 先归一化
+        k_norm_raw = (k_flat - zero) / (scale + 1e-8)
+        dense_raw, _, k_mask = extract_outliers(
+            k_norm_raw, outlier_ratio=outlier_ratio, dim=0
         )
+        dense_k = torch.clamp(dense_raw, -1.0, 1.0)
 
-        fisher = fisher_k[i].flatten()
-        weights = fisher.unsqueeze(0).expand_as(k_dense)
+        # Fisher 权重 × scale²（per-channel）
+        fisher = fisher_k[i].flatten()                 # [C]
+        w_channel = fisher * (scale ** 2)              # [C]
+        weights = w_channel.unsqueeze(0).expand_as(dense_k)  # [N, C]
 
-        k_train = k_dense[~k_mask]
+        k_train = dense_k[~k_mask]
         w_train = weights[~k_mask]
-
         if k_train.numel() == 0:
-            k_train = k_dense.reshape(-1)
+            k_train = dense_k.reshape(-1)
             w_train = weights.reshape(-1)
 
         k_codebooks.append(train_nuq_codebook(k_train, w_train, n_bits=bits_i))
         k_scales.append(scale)
         k_zeros.append(zero)
 
-        # ---------- Value: Per-Token ----------
+        # ---------------- Value: Per-Token ----------------
         v_cat = torch.cat(v_acts[i], dim=0)
-        v_min = v_cat.min(dim=-1, keepdim=True).values
-        v_max = v_cat.max(dim=-1, keepdim=True).values
+        Cv = v_cat.shape[-1]
+        v_flat = v_cat.reshape(-1, Cv)
+
+        v_min = v_flat.min(dim=-1, keepdim=True).values   # [N, 1]
+        v_max = v_flat.max(dim=-1, keepdim=True).values   # [N, 1]
         v_scale = (v_max - v_min) / 2.0
         v_zero = (v_max + v_min) / 2.0
 
-        v_norm = torch.clamp((v_cat - v_zero) / (v_scale + 1e-8), -1, 1)
-        v_dense, _, v_mask = extract_outliers(
-            v_norm, outlier_ratio=outlier_ratio, dim=-1
+        v_norm_raw = (v_flat - v_zero) / (v_scale + 1e-8)
+        dense_raw_v, _, v_mask = extract_outliers(
+            v_norm_raw, outlier_ratio=outlier_ratio, dim=-1
         )
+        dense_v = torch.clamp(dense_raw_v, -1.0, 1.0)
 
-        fisher_v_i = fisher_v[i].flatten()
-        weights_v = fisher_v_i.unsqueeze(0).expand_as(v_dense)
+        # Fisher 权重 × scale²（per-token）：[1, C] * [N, 1] -> [N, C]
+        fisher_v_i = fisher_v[i].flatten()             # [C]
+        weights_v = fisher_v_i.unsqueeze(0) * (v_scale ** 2)
 
-        v_train = v_dense[~v_mask]
+        v_train = dense_v[~v_mask]
         wv_train = weights_v[~v_mask]
-
         if v_train.numel() == 0:
-            v_train = v_dense.reshape(-1)
+            v_train = dense_v.reshape(-1)
             wv_train = weights_v.reshape(-1)
 
         v_codebooks.append(train_nuq_codebook(v_train, wv_train, n_bits=bits_i))

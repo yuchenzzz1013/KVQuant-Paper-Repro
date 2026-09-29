@@ -40,6 +40,7 @@ def main():
     n_bits = calib.get("n_bits", args.n_bits)
     outlier_ratio = calib.get("outlier_ratio", args.outlier_ratio)
     sink_token = calib.get("sink_token", True)
+    layer_bits = calib.get("layer_bits", None)
 
     quantizer = KVQuantizer(
         k_codebooks=calib["k_codebooks"],
@@ -48,6 +49,7 @@ def main():
         k_zeros=calib["k_zeros"],
         k_bits=n_bits,
         v_bits=n_bits,
+        layer_bits=layer_bits,                # <-- 关键修复
         outlier_ratio=outlier_ratio,
         sink_token=sink_token,
         use_dense_sparse=outlier_ratio > 0,

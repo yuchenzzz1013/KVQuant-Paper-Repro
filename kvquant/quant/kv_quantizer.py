@@ -51,33 +51,40 @@ class KVQuantizer:
             return self.layer_bits[layer_idx]
         return self.k_bits if is_key else self.v_bits
 
-    def _dense_sparse(self, x_norm, dim):
-        if self.use_dense_sparse and self.outlier_ratio > 0:
-            dense_x, outliers, _ = extract_outliers(
-                x_norm, outlier_ratio=self.outlier_ratio, dim=dim
-            )
-        else:
-            dense_x = x_norm
-            outliers = torch.zeros_like(x_norm)
-        return dense_x, outliers
-
     @staticmethod
     def _split_sink(x, sink: bool):
         if sink and x.size(1) > 1:
             return x[:, :1, :].contiguous(), x[:, 1:, :].contiguous()
         return None, x
 
+    def _split_outliers(self, x_norm_raw: torch.Tensor, dim: int):
+        """先在原始归一化值上提取 outlier，再对 dense 部分 clamp。"""
+        if self.use_dense_sparse and self.outlier_ratio > 0:
+            dense_raw, outliers, _ = extract_outliers(
+                x_norm_raw, outlier_ratio=self.outlier_ratio, dim=dim
+            )
+        else:
+            dense_raw = x_norm_raw
+            outliers = torch.zeros_like(x_norm_raw)
+        dense = torch.clamp(dense_raw, -1.0, 1.0)
+        return dense, outliers
+
     def quantize_k(self, layer_idx: int, k: torch.Tensor):
         codebook = self.k_codebooks[layer_idx]
-        scale = self.k_scales[layer_idx].to(k.device).float()
-        zero = self.k_zeros[layer_idx].to(k.device).float()
+        scale = self.k_scales[layer_idx].to(k.device).float()  # [C]
+        zero = self.k_zeros[layer_idx].to(k.device).float()    # [C]
 
         k_sink, k_rest = self._split_sink(k, self.sink_token)
         if k_rest.numel() == 0:
             return k
 
-        k_norm = torch.clamp((k_rest.float() - zero) / (scale + 1e-8), -1, 1)
-        dense_k, outliers_k = self._dense_sparse(k_norm, dim=1)
+        # 1) 用原始值做归一化，不 clamp
+        k_norm_raw = (k_rest.float() - zero) / (scale + 1e-8)   # [B, S, C]
+
+        # 2) outlier 提取（per-channel，dim=1 即 token 维）
+        dense_k, outliers_k = self._split_outliers(k_norm_raw, dim=1)
+
+        # 3) 查表反量化，再把 outlier 加回去
         _, q = _lut_lookup(dense_k, codebook)
         k_dequant = (q + outliers_k) * scale + zero
 
@@ -99,8 +106,13 @@ class KVQuantizer:
         scale = (v_max - v_min) / 2.0
         zero = (v_max + v_min) / 2.0
 
-        v_norm = torch.clamp((vf - zero) / (scale + 1e-8), -1, 1)
-        dense_v, outliers_v = self._dense_sparse(v_norm, dim=-1)
+        # 1) 原始归一化，不 clamp
+        v_norm_raw = (vf - zero) / (scale + 1e-8)               # [B, S, C]
+
+        # 2) outlier 提取（per-token，dim=-1 即 channel 维）
+        dense_v, outliers_v = self._split_outliers(v_norm_raw, dim=-1)
+
+        # 3) 查表 + 加回 outlier
         _, q = _lut_lookup(dense_v, codebook)
         v_dequant = (q + outliers_v) * scale + zero
 
