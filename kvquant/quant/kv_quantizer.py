@@ -1,6 +1,7 @@
 ﻿import torch
 
 from .dense_sparse import extract_outliers
+from ..kernels.cuda_ops import get_cuda_ops
 
 
 def _lut_lookup(x_norm: torch.Tensor, codebook: torch.Tensor):
@@ -24,7 +25,6 @@ def _lut_lookup(x_norm: torch.Tensor, codebook: torch.Tensor):
     idx = dist.argmin(dim=-1)
     dequant = cb.gather(0, idx)
     return idx.reshape(shape), dequant.reshape(shape)
-
 
 
 class KVQuantizer:
