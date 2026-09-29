@@ -1,4 +1,4 @@
-﻿# KVQuant 复现（个人轻量级 PyTorch 版）
+﻿# KVQuant 复现
 
 > ⚠️ 仅为个人轻量级复现
 
@@ -9,26 +9,29 @@
 
 ```
 kvquant-repro/
-├── model/                        
+├── model/
 ├── kvquant/
-│   ├── __init__.py
-│   ├── model_loader.py
-│   ├── calibration.py
-│   ├── kv_cache.py
-│   ├── attention_patch.py
-│   ├── quant/
-│   │   ├── __init__.py
-│   │   ├── nuq.py
-│   │   ├── dense_sparse.py
-│   │   └── kv_quantizer.py
-│   └── kernels/
-│       ├── __init__.py
-│       ├── rope_fused.py
-│       └── matvec_ds.py
+│ ├── init.py
+│ ├── model_loader.py
+│ ├── calibration.py
+│ ├── kv_cache.py
+│ ├── attention_patch.py
+│ ├── quant/
+│ │ ├── init.py
+│ │ ├── nuq.py
+│ │ ├── dense_sparse.py
+│ │ └── kv_quantizer.py
+│ └── kernels/
+│ ├── init.py
+│ ├── cuda_ops.py 
+│ ├── csrc/
+│ │ └── kvquant_ops.cu
+│ ├── rope_fused.py
+│ └── matvec_ds.py
 ├── benchmarks/
-│   ├── __init__.py
-│   └── perplexity.py
+│ ├── init.py
+│ └── perplexity.py
 └── scripts/
-    ├── calibrate.py
-    └── evaluate.py
+├── calibrate.py
+└── evaluate.py
 ```

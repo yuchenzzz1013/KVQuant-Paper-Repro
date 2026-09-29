@@ -4,22 +4,27 @@ from .dense_sparse import extract_outliers
 
 
 def _lut_lookup(x_norm: torch.Tensor, codebook: torch.Tensor):
-    """向量化 LUT 查找。
+    """向量化 LUT 查找（CUDA 优先）。
 
     x_norm:   [..., D]，已归一化到 [-1,1]
     codebook: [2^b]
-    返回:
-        idx:     [..., D] int64
-        dequant: [..., D] float32
+    返回: idx [..., D] int64, dequant [..., D] fp32
     """
-    cb = codebook.to(x_norm.device, dtype=torch.float32).reshape(-1)  # [2^b]
+    cuda_ops = get_cuda_ops()
+    if cuda_ops is not None and x_norm.is_cuda:
+        cb = codebook.to(x_norm.device, dtype=torch.float32).reshape(-1).contiguous()
+        idx, dq = cuda_ops.lut_lookup(x_norm.reshape(-1).float(), cb)
+        return idx.reshape(x_norm.shape), dq.reshape(x_norm.shape)
+
+    # PyTorch 回退
+    cb = codebook.to(x_norm.device, dtype=torch.float32).reshape(-1)
     shape = x_norm.shape
-    flat = x_norm.reshape(-1).float()                                # [N]
-    # 距离矩阵 [N, 2^b]
+    flat = x_norm.reshape(-1).float()
     dist = (flat.unsqueeze(1) - cb.unsqueeze(0)).abs()
-    idx = dist.argmin(dim=-1)                                        # [N]
-    dequant = cb.gather(0, idx)                                      # [N]
+    idx = dist.argmin(dim=-1)
+    dequant = cb.gather(0, idx)
     return idx.reshape(shape), dequant.reshape(shape)
+
 
 
 class KVQuantizer:
