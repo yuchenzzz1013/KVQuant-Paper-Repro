@@ -22,15 +22,58 @@ def extract_outliers(x: torch.Tensor, outlier_ratio: float = 0.01, dim: int = -1
     n = x.shape[dim]
     k = max(1, min(int(n * outlier_ratio), n))
 
-    # 用 topk.indices 生成 mask，避免阈值并列导致 > k 个 outlier
     abs_x = x.abs()
     topk_idx = torch.topk(abs_x, k, dim=dim).indices
     mask = torch.zeros_like(x, dtype=torch.bool)
     mask.scatter_(dim, topk_idx, True)
 
     dense_x = x.masked_fill(mask, 0.0)
-    outliers = x - dense_x  # 等价于 x * mask，但数值更稳
+    outliers = x - dense_x
     return dense_x, outliers, mask
+
+
+def extract_outliers_attention(
+    attn_weights: torch.Tensor,
+    k: torch.Tensor,
+    outlier_ratio: float = 0.01,
+):
+    """基于注意力分数的 Key outlier 提取（论文 §3.4 的注意力感知版本）。
+
+    attn_weights: [B, H, S_q, S_k] 注意力分数（softmax 后）
+    k:            [B, S_k, H_kv]  Key 张量
+
+    对每个 head，按注意力分数对 Key 位置加权，选出对输出影响最大的 outlier。
+
+    返回: outlier_mask [B, S_k, H_kv] bool
+    """
+    B, H_q, S_q, S_k = attn_weights.shape
+    H_kv = k.size(-1)
+
+    # GQA/MQA: 将 query head 的注意力分数聚合到 kv head
+    n_rep = H_q // H_kv
+    if n_rep > 1:
+        # [B, H_q, S_q, S_k] -> [B, H_kv, n_rep, S_q, S_k] -> mean
+        attn_agg = attn_weights.reshape(B, H_kv, n_rep, S_q, S_k).mean(dim=2)
+    else:
+        attn_agg = attn_weights
+
+    # 每个 kv head 对每个 key 位置的总注意力：对 query 维求和
+    # [B, H_kv, S_k]
+    key_importance = attn_agg.sum(dim=2)  # sum over S_q
+
+    # 对每个 head，按注意力分数 top-k 选 outlier
+    n = S_k
+    k_out = max(1, min(int(n * outlier_ratio), n))
+    topk_idx = torch.topk(key_importance, k_out, dim=-1).indices  # [B, H_kv, k]
+
+    mask = torch.zeros(B, S_k, H_kv, dtype=torch.bool, device=k.device)
+    for h in range(H_kv):
+        mask.scatter_(
+            1,
+            topk_idx[:, h, :].unsqueeze(-1).expand(-1, -1, 1),
+            True,
+        )
+    return mask
 
 
 def pack_csr(x: torch.Tensor):

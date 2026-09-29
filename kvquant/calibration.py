@@ -75,7 +75,7 @@ def calibrate(
                     k_act = k_act[:, 1:, :]
                     k_grad = k_grad[:, 1:, :]
                 k_acts[i].append(k_act.float().cpu())
-                g = (k_grad.float() ** 2).sum(dim=(0, 1)).cpu()  # [H]
+                g = (k_grad.float() ** 2).sum(dim=(0, 1)).cpu()
                 fisher_k[i] = g if fisher_k[i] is None else fisher_k[i] + g
 
             if v_act is not None and v_grad is not None:
@@ -83,7 +83,7 @@ def calibrate(
                     v_act = v_act[:, 1:, :]
                     v_grad = v_grad[:, 1:, :]
                 v_acts[i].append(v_act.float().cpu())
-                g = (v_grad.float() ** 2).sum(dim=(0, 1)).cpu()  # [H]
+                g = (v_grad.float() ** 2).sum(dim=(0, 1)).cpu()
                 fisher_v[i] = g if fisher_v[i] is None else fisher_v[i] + g
 
         act_store.clear()
@@ -112,12 +112,11 @@ def calibrate(
         fisher = fisher_k[i].flatten()                       # [H]
         weights = fisher.unsqueeze(0).expand_as(k_dense)     # [N*S, H]
 
-        # ★ 关键修复：只用非 outlier 元素训练码本
+        # 只对非 outlier 元素训练码本（论文 §3.4 核心）
         k_train = k_dense[~k_mask]
         w_train = weights[~k_mask]
 
         if k_train.numel() == 0:
-            # 极端情况：全被判为 outlier，退化为对全部元素训练
             k_train = k_dense.reshape(-1)
             w_train = weights.reshape(-1)
 
@@ -138,9 +137,10 @@ def calibrate(
             v_norm, outlier_ratio=outlier_ratio, dim=-1
         )
 
-        fisher_v_i = fisher_v[i].flatten()                    # [H]
+        fisher_v_i = fisher_v[i].flatten()
         weights_v = fisher_v_i.unsqueeze(0).expand_as(v_dense)
 
+        # 只对非 outlier 元素训练码本
         v_train = v_dense[~v_mask]
         wv_train = weights_v[~v_mask]
 

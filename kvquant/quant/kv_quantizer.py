@@ -50,7 +50,6 @@ class KVQuantizer:
         self.sink_token = sink_token
         self.use_dense_sparse = use_dense_sparse
 
-    # ---------- 内部 ----------
     def _dense_sparse(self, x_norm, dim):
         if self.use_dense_sparse and self.outlier_ratio > 0:
             dense_x, outliers, _ = extract_outliers(
@@ -115,7 +114,7 @@ class KVQuantizer:
             v_dequant = torch.cat([v_sink, v_dequant], dim=1)
         return v_dequant
 
-    # ---------- 压缩存储（用于真实内存节省 / kernel 复现） ----------
+    # ---------- 压缩存储 ----------
     def compress_k_to_csr(self, layer_idx: int, k: torch.Tensor):
         from .dense_sparse import pack_csr
 
@@ -130,7 +129,6 @@ class KVQuantizer:
         idx, _ = _lut_lookup(dense_x, codebook)
 
         B, S, H = outliers.shape
-        # [B, S, H] -> [B*H, S]，沿 token 维稀疏（等价 CSC-on-K）
         outliers_2d = outliers.permute(0, 2, 1).reshape(B * H, S)
         values, col_indices, row_ptr = pack_csr(outliers_2d)
 
@@ -163,7 +161,7 @@ class KVQuantizer:
         idx, _ = _lut_lookup(dense_x, codebook)
 
         B, S, H = outliers.shape
-        outliers_2d = outliers.reshape(B * S, H)  # 每 token 一行
+        outliers_2d = outliers.reshape(B * S, H)
         values, col_indices, row_ptr = pack_csr(outliers_2d)
 
         return {
