@@ -10,6 +10,7 @@ def calibrate(
     tokenizer,
     calib_texts,
     n_bits: int = 3,
+    layer_bits: dict = None,
     seq_len: int = 2048,
     device: str = "cuda",
     outlier_ratio: float = 0.01,
@@ -23,9 +24,14 @@ def calibrate(
     - Value: Per-Token
              -> 逐层 NUQ codebook（Fisher 加权 KMeans）
              -> scale/zero 留给在线逐 token 计算
+
+    layer_bits: 可选，{layer_idx: bit_width}。若为 None 则全部使用 n_bits。
     """
     model.eval()
     n_layers = len(model.model.layers)
+
+    if layer_bits is None:
+        layer_bits = {i: n_bits for i in range(n_layers)}
 
     act_store, grad_store = {}, {}
     hooks = []
@@ -96,23 +102,23 @@ def calibrate(
     k_scales, k_zeros = [], []
 
     for i in range(n_layers):
+        bits_i = layer_bits[i]
+
         # ---------- Key: Per-Channel Pre-RoPE ----------
-        k_cat = torch.cat(k_acts[i], dim=0)                 # [N*S, H]
-        k_min = k_cat.min(dim=0).values                     # [H]
+        k_cat = torch.cat(k_acts[i], dim=0)
+        k_min = k_cat.min(dim=0).values
         k_max = k_cat.max(dim=0).values
         scale = (k_max - k_min) / 2.0
         zero = (k_max + k_min) / 2.0
 
         k_norm = torch.clamp((k_cat - zero) / (scale + 1e-8), -1, 1)
-        # dim=0 沿 token 维剔除 outlier（per-channel）
         k_dense, _, k_mask = extract_outliers(
             k_norm, outlier_ratio=outlier_ratio, dim=0
         )
 
-        fisher = fisher_k[i].flatten()                       # [H]
-        weights = fisher.unsqueeze(0).expand_as(k_dense)     # [N*S, H]
+        fisher = fisher_k[i].flatten()
+        weights = fisher.unsqueeze(0).expand_as(k_dense)
 
-        # 只对非 outlier 元素训练码本（论文 §3.4 核心）
         k_train = k_dense[~k_mask]
         w_train = weights[~k_mask]
 
@@ -120,19 +126,18 @@ def calibrate(
             k_train = k_dense.reshape(-1)
             w_train = weights.reshape(-1)
 
-        k_codebooks.append(train_nuq_codebook(k_train, w_train, n_bits=n_bits))
+        k_codebooks.append(train_nuq_codebook(k_train, w_train, n_bits=bits_i))
         k_scales.append(scale)
         k_zeros.append(zero)
 
         # ---------- Value: Per-Token ----------
-        v_cat = torch.cat(v_acts[i], dim=0)                 # [N*S, H]
+        v_cat = torch.cat(v_acts[i], dim=0)
         v_min = v_cat.min(dim=-1, keepdim=True).values
         v_max = v_cat.max(dim=-1, keepdim=True).values
         v_scale = (v_max - v_min) / 2.0
         v_zero = (v_max + v_min) / 2.0
 
         v_norm = torch.clamp((v_cat - v_zero) / (v_scale + 1e-8), -1, 1)
-        # dim=-1 沿 channel 维剔除 outlier（per-token）
         v_dense, _, v_mask = extract_outliers(
             v_norm, outlier_ratio=outlier_ratio, dim=-1
         )
@@ -140,7 +145,6 @@ def calibrate(
         fisher_v_i = fisher_v[i].flatten()
         weights_v = fisher_v_i.unsqueeze(0).expand_as(v_dense)
 
-        # 只对非 outlier 元素训练码本
         v_train = v_dense[~v_mask]
         wv_train = weights_v[~v_mask]
 
@@ -148,14 +152,15 @@ def calibrate(
             v_train = v_dense.reshape(-1)
             wv_train = weights_v.reshape(-1)
 
-        v_codebooks.append(train_nuq_codebook(v_train, wv_train, n_bits=n_bits))
+        v_codebooks.append(train_nuq_codebook(v_train, wv_train, n_bits=bits_i))
 
     return {
         "k_codebooks": k_codebooks,
         "v_codebooks": v_codebooks,
         "k_scales": k_scales,
         "k_zeros": k_zeros,
+        "layer_bits": layer_bits,
+        "n_bits": n_bits,
         "outlier_ratio": outlier_ratio,
         "sink_token": sink_token,
-        "n_bits": n_bits,
     }
